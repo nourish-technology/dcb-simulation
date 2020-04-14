@@ -8,15 +8,19 @@ Simulator for the DCB
 Open Questions:
 
 -Should low IO be simulated, or just higher level dispenser/actuator abstractions?
--If also sumulating low level IO, should it be changed when dispenser pour is called?
+    -If also sumulating low level IO, should it be changed when dispenser pour is called?
 -How to simulate digital_in change?
--How best simulate actuator move? Takes arbitrary amout of time...
+-Use config file to set the length of moves?
+-What position do acutators start out in?
 
 """
 
 DELIMITER = '\n'
 ERROR = "ERROR"
 OK = "OK"
+
+def get_time_ms():
+    return time.time() * 1000
 
 class Dispenser(object):
     def __init__(self, id: int, timeout_ms: int = 1000):
@@ -30,19 +34,39 @@ class Dispenser(object):
         self.dispenser_start: Optional[float] = None
 
     def reset_pour_timeout(self):
-        self.dispenser_start = time.time()
+        self.dispenser_start = get_time_ms()
+
+    def get_and_reset_is_busy_str(self) -> str:
+        if self.dispenser_start is None:
+            return "0"
+        
+        if self.fixed_dispense_cycle_length is not None:
+            if self.dispenser_start + self.fixed_dispense_cycle_length >= get_time_ms():
+                self.dispenser_start = None
+                return "0"
+            return "1"
+        
+        if self.dispenser_start + self.timeout_ms >= get_time_ms():
+                self.dispenser_start = None
+                return "0"
+        
+        return "1"
+
+        
 
 class Actuator(object):
-    def __init__(self, id: int, timeout_ms: int = 1000):
+    def __init__(self, id: int, move_time_ms: int, timeout_ms: int = 1000):
         self._id: int = id
         self._timeout_ms: int = timeout_ms
 
         self._current_position: int = 0
         self._last_position_reached: int = 0
         self._target_position: int = 0
+        
+        self._move_time_ms = move_time_ms
 
-        # records if acutator is moving, None if idle, start time if pouring
-        self._actuator_start: Optional[float] = None
+        # records if acutator is moving, None if idle
+        self._actuator_start_ms: Optional[float] = None
 
         self._lock = Lock()
         self._stop = False
@@ -69,9 +93,9 @@ class Actuator(object):
         with self._lock:
             self._target_position = target
             self._current_position = 0
-            self._actuator_start = time.time()
+            self._actuator_start_ms = get_time_ms()
 
-        while (time.time() - self._actuator_start) * 1000 < self._timeout_ms:
+        while get_time_ms() - self._actuator_start_ms < self._move_time_ms:
             time.sleep(0.01)
             with self._lock:
                 if self._stop:
@@ -82,7 +106,7 @@ class Actuator(object):
 
         
         with self._lock:
-            self._actuator_start = None
+            self._actuator_start_ms = None
             self._current_position = target
             self._target_position = 0
 
@@ -98,14 +122,14 @@ class Actuator(object):
     
     def is_moving(self):
         with self._lock:
-            return self._actuator_start is not None
+            return self._actuator_start_ms is not None
 
 
 
 
 class DCB(object):
      
-    def __init__(self, identity: str, station_id: str, io_count: int, dispenser_count: int, actuator_count: int):
+    def __init__(self, identity: str, station_id: str, io_count: int, dispenser_count: int, actuator_count: int, actuator_move_time_ms: int):
         
         # Identification
         self.identity: str = identity
@@ -122,7 +146,7 @@ class DCB(object):
 
         # Abstracted components
         self.dispensers = [Dispenser(id=i) for i in range(dispenser_count)]
-        self.actuators = [Actuator(id=i) for i in range(actuator_count)]
+        self.actuators = [Actuator(id=i, move_time_ms=actuator_move_time_ms) for i in range(actuator_count)]
 
     def _in_range(self, index: Union[int, str], array: List[Any]):
         if 0 <= int(index) < len(array):
@@ -152,6 +176,16 @@ class DCB(object):
             
             self.dispensers[dispenser_id].reset_pour_timeout()
             return OK
+
+        if command[:3] == "DBY":
+            dispenser_id = int(command[4])
+            
+            if not self._in_range(dispenser_id, self.dispensers):
+                print("Requested Dispenser that is out of range")
+                return ERROR
+            
+            return "DBY:" + dispenser_id + "=" + self.dispensers[dispenser_id].get_and_reset_is_busy_str()
+
 
         if command[:3] == "MSP":
             actuator_id = int(command[4])
